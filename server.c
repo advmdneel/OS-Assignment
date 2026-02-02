@@ -1,13 +1,4 @@
-/*
- * Concurrent Networked Sudoku Game Server
- * Collaborative Sudoku - Players compete to solve a shared puzzle
- * 
- * Compatible with Minix and minimal POSIX systems
- * Single-file version - no external headers needed
- * 
- * Compile: gcc -o server server.c -lpthread
- * Run: ./server
- */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,9 +16,6 @@
 #include <time.h>
 #include <stdarg.h>
 
-// ============================================================================
-// Configuration & Constants (from common.h)
-// ============================================================================
 
 #define SHM_KEY_GAME   0x5355444F  // "SUDO"
 #define SHM_KEY_LOG    0x4C4F4753  // "LOGS"
@@ -42,8 +30,25 @@
 #define LOG_FILE "sudoku_game.log"
 #define MAX_SCORES 100
 
-#define GRID_SIZE 9
-#define BOX_SIZE 3
+// ============================================================================
+// CONFIGURABLE GRID SIZE
+// ============================================================================
+// Change these values to use different grid sizes:
+//   4x4 grid:  GRID_SIZE=4,  BOX_SIZE=2, MAX_NUM=4
+//   6x6 grid:  GRID_SIZE=6,  BOX_SIZE=2, MAX_NUM=6  (boxes are 2x3)
+//   9x9 grid:  GRID_SIZE=9,  BOX_SIZE=3, MAX_NUM=9  (standard Sudoku)
+//   12x12 grid: GRID_SIZE=12, BOX_SIZE=3, MAX_NUM=12 (boxes are 3x4)
+//   16x16 grid: GRID_SIZE=16, BOX_SIZE=4, MAX_NUM=16
+//
+// NOTE: For non-square boxes (e.g., 6x6), you may need BOX_ROWS and BOX_COLS
+//       instead of a single BOX_SIZE. See BOX_ROWS/BOX_COLS below.
+// ============================================================================
+
+#define GRID_SIZE 4        // Grid dimension (e.g., 4, 6, 9, 12, 16)
+#define BOX_ROWS   2       // Number of rows per box
+#define BOX_COLS  2        // Number of columns per box  
+#define BOX_SIZE  2        // For square boxes (BOX_ROWS == BOX_COLS)
+#define MAX_NUM   GRID_SIZE // Maximum number allowed (1 to MAX_NUM)
 #define EMPTY_CELL 0
 
 #define POINTS_CORRECT 10
@@ -51,9 +56,7 @@
 
 #define PIPE_BASE "/tmp/sudoku_pipe_"
 
-// ============================================================================
-// Type Definitions (from common.h)
-// ============================================================================
+
 
 typedef enum {
     PLAYER_DISCONNECTED = 0,
@@ -163,9 +166,8 @@ typedef struct {
     int current_turn;
 } GameMessage;
 
-// ============================================================================
 // Spinlock Functions
-// ============================================================================
+
 
 static inline void spin_lock_init(SpinLock *lock) {
     lock->lock = 0;
@@ -181,9 +183,6 @@ static inline void spin_unlock(SpinLock *lock) {
     __sync_lock_release(&lock->lock);
 }
 
-// ============================================================================
-// Global Variables
-// ============================================================================
 
 SharedGameState *game_state = NULL;
 LogQueue *log_queue = NULL;
@@ -198,9 +197,7 @@ int shm_game_id = -1;
 int shm_log_id = -1;
 int shm_scores_id = -1;
 
-// ============================================================================
-// Logging Functions
-// ============================================================================
+
 
 void enqueue_log(const char *format, ...) {
     if (!log_queue) return;
@@ -268,23 +265,23 @@ void *logger_thread_func(void *arg) {
     return NULL;
 }
 
-// ============================================================================
-// Sudoku Generation and Validation
-// ============================================================================
 
 int is_valid_placement(int grid[GRID_SIZE][GRID_SIZE], int row, int col, int num) {
+    // Check row
     for (int c = 0; c < GRID_SIZE; c++) {
         if (grid[row][c] == num) return 0;
     }
     
+    // Check column
     for (int r = 0; r < GRID_SIZE; r++) {
         if (grid[r][col] == num) return 0;
     }
     
-    int box_row = (row / BOX_SIZE) * BOX_SIZE;
-    int box_col = (col / BOX_SIZE) * BOX_SIZE;
-    for (int r = box_row; r < box_row + BOX_SIZE; r++) {
-        for (int c = box_col; c < box_col + BOX_SIZE; c++) {
+    // Check box (supports non-square boxes like 2x3 for 6x6 grids)
+    int box_row = (row / BOX_ROWS) * BOX_ROWS;
+    int box_col = (col / BOX_COLS) * BOX_COLS;
+    for (int r = box_row; r < box_row + BOX_ROWS; r++) {
+        for (int c = box_col; c < box_col + BOX_COLS; c++) {
             if (grid[r][c] == num) return 0;
         }
     }
@@ -305,10 +302,14 @@ int generate_full_grid(int grid[GRID_SIZE][GRID_SIZE]) {
     for (int row = 0; row < GRID_SIZE; row++) {
         for (int col = 0; col < GRID_SIZE; col++) {
             if (grid[row][col] == EMPTY_CELL) {
-                int nums[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-                shuffle_array(nums, 9);
+                // Create array of numbers 1 to MAX_NUM
+                int nums[MAX_NUM];
+                for (int i = 0; i < MAX_NUM; i++) {
+                    nums[i] = i + 1;
+                }
+                shuffle_array(nums, MAX_NUM);
                 
-                for (int i = 0; i < 9; i++) {
+                for (int i = 0; i < MAX_NUM; i++) {
                     if (is_valid_placement(grid, row, col, nums[i])) {
                         grid[row][col] = nums[i];
                         if (generate_full_grid(grid)) {
@@ -338,8 +339,13 @@ void generate_puzzle(SharedGameState *state, int difficulty) {
         }
     }
     
-    int cells_to_remove = 30 + (difficulty * 5);
-    if (cells_to_remove > 55) cells_to_remove = 55;
+    // Scale cells to remove based on grid size
+    // For 9x9: 30-55 cells, for 4x4: ~6-10 cells, for 16x16: ~80-140 cells
+    int total_cells = GRID_SIZE * GRID_SIZE;
+    int base_remove = (total_cells * 35) / 81;  // ~35% of cells as base
+    int cells_to_remove = base_remove + (difficulty * (total_cells / 16));
+    int max_remove = (total_cells * 65) / 100;  // Max 65% of cells
+    if (cells_to_remove > max_remove) cells_to_remove = max_remove;
     
     int removed = 0;
     while (removed < cells_to_remove) {
@@ -357,9 +363,6 @@ void generate_puzzle(SharedGameState *state, int difficulty) {
     enqueue_log("Generated puzzle with %d empty cells (difficulty: %d)", cells_to_remove, difficulty);
 }
 
-// ============================================================================
-// Score Persistence Functions
-// ============================================================================
 
 void load_scores(void) {
     FILE *file = fopen(SCORES_FILE, "r");
@@ -435,9 +438,9 @@ void update_player_stats(const char *player_name, int is_winner, int correct, in
     save_scores();
 }
 
-// ============================================================================
+
 // Round Robin Scheduler Thread
-// ============================================================================
+
 
 int get_next_active_player(int current) {
     int start = (current + 1) % MAX_PLAYERS;
@@ -545,9 +548,7 @@ void advance_turn(void) {
     spin_unlock(&game_state->game_lock);
 }
 
-// ============================================================================
-// Helper: Copy game state to message
-// ============================================================================
+
 
 void copy_state_to_message(GameMessage *msg) {
     // Copy the current shared state into a message so the client can redraw
@@ -559,9 +560,7 @@ void copy_state_to_message(GameMessage *msg) {
     msg->current_turn = game_state->current_turn;
 }
 
-// ============================================================================
-// Broadcast grid update to all active clients
-// ============================================================================
+
 
 void broadcast_grid_update(int exclude_player_id, int row, int col, int value, int success, const char *player_name) {
     // This is used so OTHER clients update automatically when someone plays.
@@ -604,9 +603,6 @@ void broadcast_grid_update(int exclude_player_id, int row, int col, int value, i
     }
 }
 
-// ============================================================================
-// Broadcast turn notification to all players
-// ============================================================================
 
 void broadcast_turn_notification(void) {
     // Purpose:
@@ -667,9 +663,68 @@ void broadcast_turn_notification(void) {
     spin_unlock(&game_state->game_lock);
 }
 
-// ============================================================================
+
+void broadcast_game_over(int winner_id, int exclude_player_id) {
+    // This function notifies ALL clients that the game has ended.
+    // The exclude_player_id is the player who made the final move (they get a direct response).
+    GameMessage game_over_msg;
+    char pipe_to_client[64];
+    
+    memset(&game_over_msg, 0, sizeof(GameMessage));
+    game_over_msg.type = MSG_GAME_OVER;
+    
+    spin_lock(&game_state->game_lock);
+    copy_state_to_message(&game_over_msg);
+    
+    int winner_score = (winner_id >= 0) ? game_state->players[winner_id].score : 0;
+    const char *winner_name = (winner_id >= 0) ? game_state->players[winner_id].name : "Unknown";
+    
+    // Log final game results with all player scores
+    enqueue_log("========== GAME OVER ==========");
+    enqueue_log("WINNER: Player %d (%s) with %d points!", winner_id + 1, winner_name, winner_score);
+    enqueue_log("Final Scores:");
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (game_state->players[i].state == PLAYER_ACTIVE || 
+            game_state->players[i].state == PLAYER_FINISHED) {
+            enqueue_log("  Player %d (%s): %d points | Correct: %d | Wrong: %d %s",
+                       i + 1, game_state->players[i].name, game_state->players[i].score,
+                       game_state->players[i].correct_placements,
+                       game_state->players[i].wrong_placements,
+                       (i == winner_id) ? " <-- WINNER" : "");
+        }
+    }
+    enqueue_log("================================");
+    
+    spin_unlock(&game_state->game_lock);
+    
+    // Send game over message to all players except the one who just played
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (i == exclude_player_id) continue;  // This player gets a direct response
+        if (game_state->players[i].state != PLAYER_ACTIVE && 
+            game_state->players[i].state != PLAYER_FINISHED) continue;
+        
+        // Customize message for winner vs losers
+        if (i == winner_id) {
+            snprintf(game_over_msg.text, MAX_LOG_MSG,
+                    "PUZZLE COMPLETE! CONGRATULATIONS - YOU WON with %d points!",
+                    winner_score);
+        } else {
+            snprintf(game_over_msg.text, MAX_LOG_MSG,
+                    "PUZZLE COMPLETE! You lost. Winner: %s with %d points. Your score: %d",
+                    winner_name, winner_score, game_state->players[i].score);
+        }
+        
+        snprintf(pipe_to_client, sizeof(pipe_to_client), "%s%d_to_client", PIPE_BASE, i);
+        int fd = open(pipe_to_client, O_WRONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            write(fd, &game_over_msg, sizeof(GameMessage));
+            close(fd);
+        }
+    }
+}
+
 // Client Handler (Child Process)
-// ============================================================================
+
 
 void handle_client(int player_id, int pipe_read_fd, int pipe_write_fd) {
     Player *player = &game_state->players[player_id];
@@ -787,9 +842,9 @@ void handle_client(int player_id, int pipe_read_fd, int pipe_write_fd) {
                     break;
                 }
                 
-                if (value < 1 || value > 9) {
+                if (value < 1 || value > MAX_NUM) {
                     response.type = MSG_ERROR;
-                    snprintf(response.text, MAX_LOG_MSG, "Invalid number %d (must be 1-9)", value);
+                    snprintf(response.text, MAX_LOG_MSG, "Invalid number %d (must be 1-%d)", value, MAX_NUM);
                     spin_unlock(&game_state->game_lock);
                     write(pipe_write_fd, &response, sizeof(GameMessage));
                     break;
@@ -865,18 +920,31 @@ void handle_client(int player_id, int pipe_read_fd, int pipe_write_fd) {
                     game_state->winner_id = winner;
                     game_state->game_state = GAME_FINISHED;
                     
+                    // Update stats for all players
+                    for (int i = 0; i < MAX_PLAYERS; i++) {
+                        if (game_state->players[i].state == PLAYER_ACTIVE) {
+                            update_player_stats(game_state->players[i].name,
+                                              i == winner,
+                                              game_state->players[i].correct_placements,
+                                              game_state->players[i].wrong_placements);
+                        }
+                    }
+                    
                     if (winner == player_id) {
                         snprintf(response.text, MAX_LOG_MSG,
                                 "PUZZLE COMPLETE! CONGRATULATIONS - YOU WON with %d points!",
                                 player->score);
                     } else if (winner >= 0) {
                         snprintf(response.text, MAX_LOG_MSG,
-                                "PUZZLE COMPLETE! Winner: %s with %d points. Your score: %d",
+                                "PUZZLE COMPLETE! You lost. Winner: %s with %d points. Your score: %d",
                                 game_state->players[winner].name, max_score, player->score);
                     }
                     
                     spin_unlock(&game_state->game_lock);
                     write(pipe_write_fd, &response, sizeof(GameMessage));
+                    
+                    // Broadcast game over to ALL other clients
+                    broadcast_game_over(winner, player_id);
                     break;
                 }
                 
@@ -940,9 +1008,9 @@ cleanup:
     exit(0);
 }
 
-// ============================================================================
+
 // Signal Handlers
-// ============================================================================
+
 
 void sigchld_handler(int sig) {
     (void)sig;
@@ -964,9 +1032,9 @@ void sigint_handler(int sig) {
     }
 }
 
-// ============================================================================
+
 // Shared Memory Setup
-// ============================================================================
+
 
 int setup_shared_memory(void) {
     shm_game_id = shmget(SHM_KEY_GAME, sizeof(SharedGameState), IPC_CREAT | 0666);
@@ -1048,9 +1116,7 @@ void cleanup_shared_memory(void) {
     printf("[Server] Shared memory cleaned up\n");
 }
 
-// ============================================================================
-// Named Pipe Setup
-// ============================================================================
+
 
 int setup_named_pipes(void) {
     char pipe_to_server[64], pipe_to_client[64];
@@ -1087,9 +1153,7 @@ void cleanup_named_pipes(void) {
     printf("[Server] Named pipes cleaned up\n");
 }
 
-// ============================================================================
-// Player Connection Handler
-// ============================================================================
+
 
 void accept_player_connections(void) {
     char pipe_to_server[64], pipe_to_client[64];
@@ -1139,14 +1203,18 @@ void accept_player_connections(void) {
     }
 }
 
-// ============================================================================
+
 // Main Function
-// ============================================================================
+
 
 int main(void) {
     printf("======================================\n");
     printf("  COLLABORATIVE SUDOKU GAME SERVER\n");
     printf("  Minix/Mini OS Compatible Version\n");
+    printf("======================================\n");
+    printf("  Grid Size: %dx%d\n", GRID_SIZE, GRID_SIZE);
+    printf("  Box Size:  %dx%d\n", BOX_ROWS, BOX_COLS);
+    printf("  Numbers:   1-%d\n", MAX_NUM);
     printf("======================================\n\n");
     
     srand(time(NULL));
